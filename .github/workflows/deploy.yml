@@ -1,0 +1,168 @@
+name: Deploy Website
+
+on:
+  push:
+    branches: [main, dev]
+  workflow_dispatch:
+
+# Two pushes at once make CloudFormation throw "stack is in UPDATE_IN_PROGRESS".
+# Queue them instead of racing.
+concurrency:
+  group: deploy-${{ github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  TEMPLATE: infrastructure/server.yaml
+  INSTANCE_TYPE: t3.micro
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Pick the environment from the branch
+        id: env
+        run: |
+          set -euo pipefail
+          # main -> prod, dev -> dev. One stack per environment, so the two servers can
+          # never overwrite each other.
+          if [ "$GITHUB_REF_NAME" = "main" ]; then ENV=prod; else ENV=dev; fi
+          echo "name=$ENV"        >> "$GITHUB_OUTPUT"
+          echo "stack=web-$ENV"   >> "$GITHUB_OUTPUT"
+          echo "Branch $GITHUB_REF_NAME -> environment $ENV"
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Validate template
+        run: aws cloudformation validate-template --template-body file://"$TEMPLATE" >/dev/null
+
+      - name: Find the default VPC and one subnet
+        id: net
+        run: |
+          set -euo pipefail
+          VPC_ID=$(aws ec2 describe-vpcs --filters Name=is-default,Values=true \
+            --query 'Vpcs[0].VpcId' --output text)
+          [ "$VPC_ID" != "None" ] || { echo "::error::no default VPC in $AWS_REGION"; exit 1; }
+          SUBNET_ID=$(aws ec2 describe-subnets \
+            --filters Name=vpc-id,Values="$VPC_ID" Name=default-for-az,Values=true \
+            --query 'Subnets[0].SubnetId' --output text)
+
+          echo "vpc_id=$VPC_ID"       >> "$GITHUB_OUTPUT"
+          echo "subnet_id=$SUBNET_ID" >> "$GITHUB_OUTPUT"
+          echo "Using $VPC_ID / $SUBNET_ID"
+
+      - name: Clear a stack stuck in ROLLBACK
+        run: |
+          set -euo pipefail
+          # A stack in ROLLBACK_COMPLETE can never be updated, only deleted. Without this,
+          # every later push fails with a confusing "cannot update" error.
+          STACK='${{ steps.env.outputs.stack }}'
+          STATUS=$(aws cloudformation describe-stacks --stack-name "$STACK" \
+            --query 'Stacks[0].StackStatus' --output text 2>/dev/null || echo NONE)
+          echo "Current status: $STATUS"
+          case "$STATUS" in
+            ROLLBACK_COMPLETE|ROLLBACK_FAILED|DELETE_FAILED|REVIEW_IN_PROGRESS)
+              aws cloudformation delete-stack --stack-name "$STACK"
+              aws cloudformation wait stack-delete-complete --stack-name "$STACK"
+              ;;
+          esac
+      - name: Deploy the server
+        run: |
+          set -euo pipefail
+          # Derived, never hardcoded: GITHUB_REPOSITORY is always "owner/repo", so this
+          # keeps working after a fork or a rename.
+          OWNER="${GITHUB_REPOSITORY%%/*}"
+          REPO="${GITHUB_REPOSITORY#*/}"
+          aws cloudformation deploy \
+            --template-file "$TEMPLATE" \
+            --stack-name '${{ steps.env.outputs.stack }}' \
+            --no-fail-on-empty-changeset \
+            --tags Environment=${{ steps.env.outputs.name }} ManagedBy=github-actions \
+            --parameter-overrides \
+              EnvironmentName=${{ steps.env.outputs.name }} \
+              GitHubUser="$OWNER" \
+              GitHubRepo="$REPO" \
+              GitBranch=${{ github.ref_name }} \
+              VpcId=${{ steps.net.outputs.vpc_id }} \
+              SubnetId=${{ steps.net.outputs.subnet_id }} \
+              InstanceType=$INSTANCE_TYPE \
+              KeyName=vockey
+
+      - name: Show why, if it failed
+        if: failure()
+        run: |
+          aws cloudformation describe-stack-events --stack-name '${{ steps.env.outputs.stack }}' \
+            --query 'reverse(StackEvents[?ResourceStatus==`CREATE_FAILED`||ResourceStatus==`UPDATE_FAILED`].[Timestamp,LogicalResourceId,ResourceStatusReason])' \
+            --output table || true
+      - name: Read the server address
+        id: out
+        run: |
+          set -euo pipefail
+          IP=$(aws cloudformation describe-stacks --stack-name '${{ steps.env.outputs.stack }}' \
+            --query "Stacks[0].Outputs[?OutputKey=='PublicIp'].OutputValue" --output text)
+          echo "ip=$IP" >> "$GITHUB_OUTPUT"
+          echo "Server: $IP"
+      - name: Wait for the server to answer
+        run: |
+          set -uo pipefail
+          IP='${{ steps.out.outputs.ip }}'
+          # A fresh instance needs to boot and install nginx (90-180s). Poll instead of
+          # sleeping a fixed time, so an update deploy is not artificially slow.
+          for i in $(seq 1 40); do
+            CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "http://$IP/health" || echo 000)
+            echo "[$i/40] GET /health -> $CODE"
+            [ "$CODE" = "200" ] && exit 0
+            sleep 10
+          done
+          echo "::error::server did not answer within ~7 minutes"
+          exit 1
+      - name: Push this commit to the server
+        env:
+          SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          IP='${{ steps.out.outputs.ip }}'
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/lab.pem
+          chmod 600 ~/.ssh/lab.pem
+          # The commit sha, not the branch name: this pins the page to exactly the code
+          # that triggered the run, not to whatever the branch points at a minute later.
+          n=0
+          until ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -i ~/.ssh/lab.pem \
+                ec2-user@"$IP" "sudo /usr/local/bin/render-site.sh ${{ github.sha }}"; do
+            n=$((n+1))
+            [ "$n" -lt 8 ] || { echo "::error::could not reach the server over SSH"; exit 1; }
+            echo "ssh not ready, retry $n"
+            sleep 10
+          done
+
+      - name: Verify what is actually live
+        run: |
+          IP='${{ steps.out.outputs.ip }}'
+          SHORT=$(echo '${{ github.sha }}' | cut -c1-7)
+          PAGE=$(curl -s --max-time 15 "http://$IP/")
+          echo "$PAGE" | grep -q "$SHORT" \
+            && echo "Live version is $SHORT" \
+            || echo "Warning: the page does not show $SHORT"
+      - name: Summary
+        run: |
+          {
+            echo "## Deployed ${{ steps.env.outputs.name }}"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| URL | http://${{ steps.out.outputs.ip }} |"
+            echo "| Stack | ${{ steps.env.outputs.stack }} |"
+            echo "| Branch | ${{ github.ref_name }} |"
+            echo "| Commit | ${{ github.sha }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
